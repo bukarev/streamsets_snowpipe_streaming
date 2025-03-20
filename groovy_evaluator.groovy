@@ -1,14 +1,14 @@
-import java.util.Properties
-import net.snowflake.ingest.streaming.InsertValidationResponse
-import net.snowflake.ingest.streaming.OpenChannelRequest
-import net.snowflake.ingest.streaming.SnowflakeStreamingIngestChannel
-import net.snowflake.ingest.streaming.SnowflakeStreamingIngestClient
-import net.snowflake.ingest.streaming.SnowflakeStreamingIngestClientFactory
 import java.net.URL
 import java.util.Date
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
+import java.util.Properties
+import net.snowflake.ingest.streaming.OpenChannelRequest
+import net.snowflake.ingest.streaming.SnowflakeStreamingIngestChannel
+import net.snowflake.ingest.streaming.SnowflakeStreamingIngestClient
+import net.snowflake.ingest.streaming.SnowflakeStreamingIngestClientFactory
+import net.snowflake.ingest.streaming.InsertValidationResponse
 
 dbName = sdc.pipelineParameters()['p_sfl_db']
 schemaName = sdc.pipelineParameters()['p_sfl_schema']
@@ -40,46 +40,54 @@ try (
         OpenChannelRequest.OnErrorOption.CONTINUE
     )
         .build();
-
-  // Open a streaming ingest channel from the given client
+    // Open a streaming ingest channel from the given client
     SnowflakeStreamingIngestChannel channel1 = client.openChannel(request1);
     // Insert rows into the channel (Using insertRows API)
     records = sdc.records
+    firstOffset = ""
     lastOffset = ""
     batchCounter = 0
+    List < Map < String, Object >> insertRecords = []
     for (record in records) {
-        Map < String, Object > row = new HashMap <  > ();
+        if (!this.properties.containsKey('row')) {
+            firstOffset = record.attributes['ss_offset']
+        }
+        lastOffset = record.attributes['ss_offset']
+        Map < String, Object > row = new HashMap < > ();
         for (key in record.value.keySet()) {
             if (record.value[key] instanceof Date) {
                 localDateTime = record.value[key].toInstant().atZone(ZoneId.systemDefault()).toLocalDateTime()
                 row.put(key, localDateTime)
             } else {
-                row.put(key, record.value[key]);
+                row.put(key, record.value[key])
             }
         }
-        // Insert the row with the current offset_token
-        InsertValidationResponse response = channel1.insertRow(row, record.attributes['ss_offset']);
-        if (response.hasErrors()) {
-            // erroneous row
-            throw response.getInsertErrors().get(0).getException();
-        } else {
-            lastOffset = record.attributes['ss_offset']
-            batchCounter = batchCounter + 1
-            sdc.output.write(record)
+        insertRecords.add(row)
+        batchCounter = batchCounter + 1
+    }
+    // Insert the row with the current offset_token
+    InsertValidationResponse response = channel1.insertRows(insertRecords, firstOffset, lastOffset)
+    List < Integer > errorIndexes = []
+    if (response.hasErrors()) {
+        // erroneous rows
+        for (insError in response.getInsertErrors()) {
+            errorIndexes.add(insError.getRowIndex().toInteger())
+            sdc.error.write(sdc.records[insError.getRowIndex().toInteger()], insError.getException().toString())
         }
     }
     // Check the offset_token registered in Snowflake to make sure everything is committed
+    recordsInserted = records.size() - errorIndexes.size()
+    endTime = System.currentTimeMillis() + (sdc.userParams['confirmation_timeout_s'].toInteger() * 1000)
     do {
         String offsetTokenFromSnowflake = channel1.getLatestCommittedOffsetToken();
-        if ( offsetTokenFromSnowflake != null && 
-            offsetTokenFromSnowflake == lastOffset ) {
-            sdc.log.info("SUCCESSFULLY inserted " + batchCounter + " rows");
-            break ;
+        if (
+            offsetTokenFromSnowflake != null && offsetTokenFromSnowflake == lastOffset
+        ) {
+            sdc.log.info("SUCCESSFULLY inserted " + recordsInserted + " rows and sent " + errorIndexes.size() 
+                + " to error.");
+            break;
         }
-    } while (true);
-  
-// Close the channel, the function internally will make sure everything is committed (or throw
-    // an exception if there is any issue)
+    } while (System.currentTimeMillis() < endTime);
     channel1.close().get();
 }
 catch (e) {
